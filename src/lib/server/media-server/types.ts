@@ -203,6 +203,9 @@ export interface MediaServer {
 	/** Read exact current artwork bytes for snapshots and post-write verification. */
 	readArtwork?(itemId: string, kind: ServerArtworkKind): Promise<ServerArtwork | null>;
 
+	/** The item's on-disk media path (provider's own view), for local artwork mirroring. */
+	getItemMediaPath?(itemId: string): Promise<string | null>;
+
 	/** Remove an explicitly set artwork slot when the provider supports absence restoration. */
 	deleteArtwork?(itemId: string, kind: ServerArtworkKind): Promise<void>;
 

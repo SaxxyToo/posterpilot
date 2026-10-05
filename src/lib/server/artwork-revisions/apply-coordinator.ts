@@ -33,6 +33,7 @@ import {
 	verifyServerArtworkRead,
 	type ArtworkVerificationResult
 } from '$lib/server/revisions/verification';
+import type { LocalArtworkWriter } from '$lib/server/media-folders/local-artwork';
 import type { ArtworkRevisionLedger } from './ledger';
 import type { ArtworkSnapshotRepository } from './snapshots';
 
@@ -65,6 +66,8 @@ export interface ArtworkApplyCoordinatorOptions {
 		targetItemIds: number[];
 	};
 	kometaAssetsDirectory: string;
+	/** Mirrors applied artwork into the media folder when configured; best-effort. */
+	localArtwork?: LocalArtworkWriter;
 	clock?: () => Date;
 	/**
 	 * Test/integration seam; null or empty results fail the mandatory preflight.
@@ -504,6 +507,9 @@ export function createArtworkApplyCoordinator(options: ArtworkApplyCoordinatorOp
 					}
 				: {})
 		});
+		if (verified && afterArtwork && afterArtwork.data.byteLength > 0) {
+			await mirrorLocalArtwork(server, operation, afterArtwork.data);
+		}
 		return {
 			...result,
 			status: failed ? 'failed' : 'success',
@@ -515,6 +521,31 @@ export function createArtworkApplyCoordinator(options: ArtworkApplyCoordinatorOp
 				? { artworkVersion: recorded.currentSlotState.artworkVersion }
 				: {})
 		};
+	}
+
+	/**
+	 * Best-effort mirror of the verified artwork into the media folder. Failures
+	 * here never fail the apply: the revision is already recorded at this point.
+	 */
+	async function mirrorLocalArtwork(
+		server: MediaServer | undefined,
+		operation: ApplyPlanOperation,
+		bytes: ArrayBuffer
+	): Promise<void> {
+		if (!options.localArtwork) return;
+		try {
+			const itemPath = server?.getItemMediaPath
+				? await server.getItemMediaPath(operation.targetId)
+				: null;
+			await options.localArtwork.write({
+				itemPath,
+				kind: serverArtworkKind(operation),
+				bytes,
+				mediaItemId: operation.target.mediaItemId
+			});
+		} catch {
+			// Never fail the apply over the local mirror.
+		}
 	}
 
 	async function recordKometaOutcome(

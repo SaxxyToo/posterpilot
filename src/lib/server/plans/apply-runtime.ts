@@ -20,6 +20,7 @@ import { assertNoPendingKometaConfigMutationWhileOwned } from '$lib/server/komet
 import { loadKometaMigrationJournalForGuard } from '$lib/server/kometa/migration-store';
 import { kometaMigrationCollisionState } from '$lib/server/kometa/migration-state';
 import { writeKometaYaml } from '$lib/server/kometa/yaml';
+import { createLocalArtworkWriterFromEnv } from '$lib/server/media-folders/local-artwork';
 import { getActiveServerInstance } from '$lib/server/server-instances';
 import {
 	exactApplyPreviewResponse,
@@ -194,9 +195,8 @@ export async function executeDatabaseFrozenApplyJob(
 				? (plan) => assertCollectionApplyContextFresh(db, plan)
 				: undefined
 	});
-	const snapshotStore = new ArtworkSnapshotStore(
-		resolveArtworkSnapshotDirectory(resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE))
-	);
+	const dataPaths = resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE);
+	const snapshotStore = new ArtworkSnapshotStore(resolveArtworkSnapshotDirectory(dataPaths));
 	const coordinator = createArtworkApplyCoordinator({
 		snapshots: createArtworkSnapshotRepository(db, snapshotStore),
 		ledger: createArtworkRevisionLedger(db),
@@ -209,7 +209,8 @@ export async function executeDatabaseFrozenApplyJob(
 						targetItemIds: payload.plan.scope.targetItemIds
 					}
 				: undefined,
-		kometaAssetsDirectory: kometaOutputDirectory(config)
+		kometaAssetsDirectory: kometaOutputDirectory(config),
+		localArtwork: createLocalArtworkWriterFromEnv(env, dataPaths.dataDirectory)
 	});
 	const preflightKometa = (operations: readonly ApplyPlanOperation[]) => {
 		const filenames = new Set<string>();

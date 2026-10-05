@@ -20,6 +20,10 @@ import {
 	type CustomUploadPlanPreview
 } from './custom-upload-plan';
 import { refreshCoverageAfter } from '$lib/server/coverage/refresh';
+import {
+	createLocalArtworkWriterFromEnv,
+	type LocalArtworkWriter
+} from '$lib/server/media-folders/local-artwork';
 import { createArtworkRevisionLedger, type ArtworkRevisionLedger } from './ledger';
 import { ArtworkSnapshotStore, resolveArtworkSnapshotDirectory } from './snapshot-store';
 import { createArtworkSnapshotRepository, type ArtworkSnapshotRepository } from './snapshots';
@@ -50,6 +54,8 @@ export interface CustomUploadRuntimeDependencies {
 	store: CustomUploadOperationPlanStore;
 	snapshots: ArtworkSnapshotRepository;
 	ledger: ArtworkRevisionLedger;
+	/** Mirrors the verified upload into the media folder when configured; best-effort. */
+	localArtwork?: LocalArtworkWriter;
 	getActiveServerInstanceId(): Promise<string | null>;
 	getItem(mediaItemId: number, serverInstanceId: string): Promise<CustomUploadRuntimeItem | null>;
 	resolveServer(serverInstanceId: string): Promise<MediaServer>;
@@ -315,6 +321,21 @@ export function createCustomUploadRuntime(dependencies: CustomUploadRuntimeDepen
 					}
 				: {})
 		});
+		if (verified && afterArtwork && afterArtwork.data.byteLength > 0 && dependencies.localArtwork) {
+			try {
+				const itemPath = scope.server.getItemMediaPath
+					? await scope.server.getItemMediaPath(scope.item.targetId)
+					: null;
+				await dependencies.localArtwork.write({
+					itemPath,
+					kind: 'poster',
+					bytes: afterArtwork.data,
+					mediaItemId: scope.item.id
+				});
+			} catch {
+				// Never fail the upload over the local mirror.
+			}
+		}
 		await dependencies.ledger.finalizeGroup({
 			groupId: group.id,
 			serverInstanceId: scope.serverInstanceId,
@@ -354,9 +375,8 @@ let liveRuntime: ReturnType<typeof createCustomUploadRuntime> | null = null;
 
 function runtime() {
 	if (liveRuntime) return liveRuntime;
-	const snapshotStore = new ArtworkSnapshotStore(
-		resolveArtworkSnapshotDirectory(resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE))
-	);
+	const dataPaths = resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE);
+	const snapshotStore = new ArtworkSnapshotStore(resolveArtworkSnapshotDirectory(dataPaths));
 	liveRuntime = createCustomUploadRuntime({
 		store: operationPlanStore,
 		snapshots: createArtworkSnapshotRepository(db, snapshotStore),
@@ -374,7 +394,8 @@ function runtime() {
 		},
 		resolveServer: async (serverInstanceId) =>
 			(await resolveMediaServerInstance(serverInstanceId, { requireEnabled: true })).server,
-		refreshCoverageAfter
+		refreshCoverageAfter,
+		localArtwork: createLocalArtworkWriterFromEnv(env, dataPaths.dataDirectory)
 	});
 	return liveRuntime;
 }

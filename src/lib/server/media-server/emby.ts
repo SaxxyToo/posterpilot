@@ -302,6 +302,22 @@ export function embyLikeProvider(
 	}
 
 	/**
+	 * The item's on-disk media path (in the server's container view), used to
+	 * mirror applied artwork into the media folder as a local file.
+	 */
+	async function readItemMediaPath(itemId: string): Promise<string | null> {
+		try {
+			const listed = await getJson<RawEmbyItemsResponse>(
+				`/Items?ids=${encodeURIComponent(itemId)}&Fields=Path`
+			);
+			const item = listed.Items?.[0];
+			return typeof item?.Path === 'string' && item.Path.length > 0 ? item.Path : null;
+		} catch {
+			return null;
+		}
+	}
+
+	/**
 	 * Apply a backdrop so the new image actually becomes the visible one. Jellyfin's
 	 * `POST /Items/{id}/Images/Backdrop` APPENDS, so the new backdrop lands behind the
 	 * existing one(s); Jellyfin/Infuse keep showing `BackdropImageTags[0]`, and the
@@ -607,6 +623,8 @@ export function embyLikeProvider(
 		},
 
 		readArtwork: readCurrentArtwork,
+
+		getItemMediaPath: readItemMediaPath,
 
 		deleteArtwork: deleteCurrentArtwork,
 

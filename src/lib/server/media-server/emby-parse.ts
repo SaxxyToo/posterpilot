@@ -35,6 +35,8 @@ export interface RawEmbyItem {
 	DateLastModified?: string | null;
 	/** When the item was added to the library, as an ISO-8601 string. */
 	DateCreated?: string | null;
+	/** On-disk path of the item's media file, in the server's own container view. */
+	Path?: string | null;
 	/** Per-user playback state (requires the authenticated user context). */
 	UserData?: { Played?: boolean | null } | null;
 }
