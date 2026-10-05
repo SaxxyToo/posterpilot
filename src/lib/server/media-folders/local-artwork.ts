@@ -1,7 +1,8 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
-	copyFile,
+	lstat,
 	mkdir,
+	realpath,
 	readFile,
 	readdir,
 	rename,
@@ -9,7 +10,7 @@ import {
 	unlink,
 	writeFile
 } from 'node:fs/promises';
-import { basename, dirname, extname, join } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /**
  * Mirror applied artwork into the media folders as local image files.
@@ -41,11 +42,12 @@ export function parseMediaPathMap(raw: string | null | undefined): MediaPathMapp
 		if (!trimmed) continue;
 		const separator = trimmed.indexOf(':');
 		if (separator <= 0 || separator === trimmed.length - 1) continue;
-		const from = trimmed.slice(0, separator).trim().replace(/\/+$/, '');
-		const to = trimmed
-			.slice(separator + 1)
-			.trim()
-			.replace(/\/+$/, '');
+		const from = trimmed.slice(0, separator).trim().replace(/\/+$/, '') || '/';
+		const to =
+			trimmed
+				.slice(separator + 1)
+				.trim()
+				.replace(/\/+$/, '') || '/';
 		if (!from.startsWith('/') || !to.startsWith('/')) continue;
 		mappings.push({ from, to });
 	}
@@ -54,17 +56,13 @@ export function parseMediaPathMap(raw: string | null | undefined): MediaPathMapp
 
 /** Translate a media-server item path into this app's filesystem view. */
 export function mapItemPath(itemPath: string, mappings: MediaPathMapping[]): string | null {
-	for (const mapping of mappings) {
-		if (itemPath === mapping.from) return mapping.to;
-		if (itemPath.startsWith(`${mapping.from}/`)) {
-			return `${mapping.to}${itemPath.slice(mapping.from.length)}`;
-		}
-	}
-	return null;
+	const mapping = matchingMapping(itemPath, mappings);
+	return mapping ? resolve(mapping.to, relative(resolve(mapping.from), resolve(itemPath))) : null;
 }
 
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png', 'webp', 'tbn', 'bmp', 'gif'];
-const POSTER_CONFLICT_BASES = ['folder', 'poster', 'cover'];
+const VIDEO_EXTENSIONS = ['mkv', 'mp4', 'avi', 'm4v', 'mov', 'wmv', 'ts', 'mts', 'm2ts', 'webm'];
+const POSTER_CONFLICT_BASES = ['folder', 'poster', 'cover', 'default', 'movie', 'show'];
 const BACKGROUND_CONFLICT_BASES = ['fanart', 'backdrop', 'background'];
 
 /** Identify an image format from magic bytes so the local file is served raw. */
@@ -112,22 +110,39 @@ function sha256Hex(bytes: Uint8Array): string {
 
 export type LocalArtworkKind = 'poster' | 'background';
 
+export type LocalArtworkItemType = 'movie' | 'show' | 'season' | 'episode';
+
 export type LocalArtworkWriteOutcome =
 	| { status: 'written'; path: string; moved: string[] }
-	| { status: 'unchanged'; path: string }
-	| { status: 'skipped'; reason: string };
+	| { status: 'unchanged'; path: string; moved?: string[] }
+	| { status: 'skipped'; reason: string }
+	| { status: 'removed'; path: string; backedUp: string | null };
 
 export interface LocalArtworkWriteInput {
 	/** The media server's path for the item (e.g. `/data/movies/Title/movie.mkv`), or null. */
 	itemPath: string | null;
+	itemType: LocalArtworkItemType;
 	kind: LocalArtworkKind;
 	/** The verified bytes as read back from the server after the apply. */
 	bytes: ArrayBuffer | Uint8Array;
 	mediaItemId: number;
 }
 
+export interface LocalArtworkRestoreInput {
+	/** The media server's path for the item. */
+	itemPath: string | null;
+	itemType: LocalArtworkItemType;
+	kind: LocalArtworkKind;
+	mediaItemId: number;
+	/** Desired bytes, or null to indicate the artwork should be absent. */
+	bytes: ArrayBuffer | Uint8Array | null;
+	/** Pre-undo server bytes — CAS anchor. Restore only operates when canonical file matches by hash. */
+	expectedBytes: ArrayBuffer | Uint8Array;
+}
+
 export interface LocalArtworkWriter {
 	write(input: LocalArtworkWriteInput): Promise<LocalArtworkWriteOutcome>;
+	restore(input: LocalArtworkRestoreInput): Promise<LocalArtworkWriteOutcome>;
 }
 
 export interface LocalArtworkWriterOptions {
@@ -141,102 +156,250 @@ function isImageFile(name: string): boolean {
 	return IMAGE_EXTENSIONS.includes(extname(name).slice(1).toLowerCase());
 }
 
-function isConflictFile(name: string, kind: LocalArtworkKind, videoBase: string): boolean {
-	if (!isImageFile(name)) return false;
-	const lower = name.toLowerCase();
-	const stem = lower.slice(0, lower.lastIndexOf('.'));
-	if (kind === 'poster') {
-		return POSTER_CONFLICT_BASES.includes(stem) || stem === videoBase;
-	}
-	return BACKGROUND_CONFLICT_BASES.includes(stem);
+function isVideoFile(name: string): boolean {
+	return VIDEO_EXTENSIONS.includes(extname(name).slice(1).toLowerCase());
 }
 
-async function uniqueBackupPath(directory: string, name: string): Promise<string> {
-	let candidate = join(directory, name);
-	let suffix = 1;
-	for (;;) {
-		try {
-			await stat(candidate);
-			candidate = join(directory, `${name}.${suffix}`);
-			suffix += 1;
-		} catch {
-			return candidate;
+function contained(root: string, path: string): boolean {
+	const suffix = relative(root, path);
+	return suffix !== '..' && !suffix.startsWith(`..${sep}`) && !isAbsolute(suffix);
+}
+
+function safeAbsolute(path: string): boolean {
+	return isAbsolute(path) && !path.includes('\0') && !path.split('/').includes('..');
+}
+
+function matchingMapping(
+	itemPath: string,
+	mappings: MediaPathMapping[]
+): MediaPathMapping | undefined {
+	if (!safeAbsolute(itemPath)) return undefined;
+	return [...mappings]
+		.filter(({ from, to }) => safeAbsolute(from) && safeAbsolute(to))
+		.sort((a, b) => b.from.length - a.from.length)
+		.find(({ from }) => contained(resolve(from), resolve(itemPath)));
+}
+
+function toBytes(data: ArrayBuffer | Uint8Array): Uint8Array {
+	return data instanceof Uint8Array ? data : new Uint8Array(data);
+}
+
+interface LocalTarget {
+	folder: string;
+	stem: string;
+	conflictStems: Set<string>;
+}
+
+type LocalTargetInput = Pick<LocalArtworkWriteInput, 'itemPath' | 'itemType' | 'kind'>;
+
+async function resolveTarget(
+	input: LocalTargetInput,
+	mappings: MediaPathMapping[]
+): Promise<LocalTarget> {
+	if (!input.itemPath) throw new Error('item has no media path');
+	const mapping = matchingMapping(input.itemPath, mappings);
+	const mapped = mapItemPath(input.itemPath, mappings);
+	if (!mapping || !mapped) throw new Error('media path is not safely covered by MEDIA_PATH_MAP');
+	if (input.itemType === 'episode' && input.kind === 'background') {
+		throw new Error('episode background artwork is not supported');
+	}
+	const directoryItem = input.itemType === 'show' || input.itemType === 'season';
+	const lexicalFolder = directoryItem ? mapped : dirname(mapped);
+	const root = await realpath(mapping.to);
+	const folder = await realpath(lexicalFolder);
+	if (!contained(root, folder) || !contained(resolve(mapping.to), resolve(lexicalFolder))) {
+		throw new Error('media folder escapes its mapping');
+	}
+	if (!(await stat(folder)).isDirectory()) throw new Error('media folder not found');
+	if (input.itemType === 'season') {
+		// Parent-level season art takes precedence. Do not guess which parent file
+		// belongs to this season without the provider's season name and index.
+		if (!contained(root, dirname(folder))) throw new Error('season parent is outside mapping');
+		const parentFiles = await readdir(dirname(folder));
+		if (
+			parentFiles.some(
+				(name) => isImageFile(name) && /-(poster|fanart)$/i.test(basename(name, extname(name)))
+			)
+		) {
+			throw new Error('parent show directory has artwork overrides; season mirror skipped');
 		}
+	}
+	const videoBase = basename(mapped, extname(mapped));
+	const lowerBase = videoBase.toLowerCase();
+	const entries = await readdir(folder);
+	const shared =
+		input.itemType === 'movie' &&
+		entries.some(
+			(name) => isVideoFile(name) && basename(name, extname(name)).toLowerCase() !== lowerBase
+		);
+	const generic = input.kind === 'poster' ? POSTER_CONFLICT_BASES : BACKGROUND_CONFLICT_BASES;
+	const conflictStems = new Set<string>();
+	let stem: string;
+	if (input.itemType === 'episode') {
+		stem = `${videoBase}-thumb`;
+		conflictStems.add(lowerBase);
+		conflictStems.add(stem.toLowerCase());
+	} else {
+		stem = shared
+			? `${videoBase}-${input.kind === 'poster' ? 'poster' : 'fanart'}`
+			: input.kind === 'poster'
+				? 'folder'
+				: 'fanart';
+		if (!shared) {
+			for (const name of generic) conflictStems.add(name);
+			if (input.kind === 'poster') conflictStems.add(input.itemType === 'movie' ? 'movie' : 'show');
+		}
+		if (input.itemType === 'movie') {
+			if (input.kind === 'poster') conflictStems.add(lowerBase);
+			for (const name of generic) conflictStems.add(`${lowerBase}-${name}`);
+		}
+	}
+	return { folder, stem, conflictStems };
+}
+
+interface LocalFile {
+	name: string;
+	path: string;
+	bytes: Uint8Array;
+}
+
+async function readConflicts(target: LocalTarget): Promise<LocalFile[]> {
+	const files: LocalFile[] = [];
+	for (const name of await readdir(target.folder)) {
+		if (
+			!isImageFile(name) ||
+			!target.conflictStems.has(basename(name, extname(name)).toLowerCase())
+		)
+			continue;
+		const path = join(target.folder, name);
+		// Do not follow artwork symlinks, including dangling links, or read devices.
+		const info = await lstat(path);
+		if (!info.isFile() || info.isSymbolicLink()) throw new Error('artwork is not a regular file');
+		files.push({ name, path, bytes: await readFile(path) });
+	}
+	return files;
+}
+
+async function backupFile(file: LocalFile, directory: string, name: string): Promise<string> {
+	await mkdir(directory, { recursive: true });
+	for (let suffix = 0; ; suffix += 1) {
+		const path = join(directory, suffix ? `${name}.${suffix}` : name);
+		try {
+			// Exclusive create preserves earlier backups even under concurrent writers.
+			await writeFile(path, file.bytes, { flag: 'wx', mode: 0o600 });
+			return path;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+		}
+	}
+}
+
+// Serialize local filesystem changes across writer instances in this process.
+const pendingFolders = new Map<string, Promise<void>>();
+async function withFolderLock<T>(folder: string, work: () => Promise<T>): Promise<T> {
+	const previous = pendingFolders.get(folder) ?? Promise.resolve();
+	let release!: () => void;
+	const next = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	pendingFolders.set(folder, next);
+	await previous;
+	try {
+		return await work();
+	} finally {
+		release();
+		if (pendingFolders.get(folder) === next) pendingFolders.delete(folder);
 	}
 }
 
 export function createLocalArtworkWriter(options: LocalArtworkWriterOptions): LocalArtworkWriter {
 	const log = options.logger ?? (() => {});
-	return {
-		async write(input) {
-			try {
-				if (!input.itemPath) return { status: 'skipped', reason: 'item has no media path' };
-				const mapped = mapItemPath(input.itemPath, options.mappings);
-				if (!mapped) {
-					return { status: 'skipped', reason: 'media path is not covered by MEDIA_PATH_MAP' };
+	async function reconcile(
+		input: LocalArtworkWriteInput | LocalArtworkRestoreInput,
+		restoring: boolean
+	): Promise<LocalArtworkWriteOutcome> {
+		try {
+			const target = await resolveTarget(input, options.mappings);
+			return await withFolderLock(target.folder, async () => {
+				const bytes = input.bytes === null ? null : toBytes(input.bytes);
+				const ext = bytes ? imageExtensionForBytes(bytes) : null;
+				if (bytes && !ext) throw new Error('unrecognized image format');
+				const files = await readConflicts(target);
+				const expected = restoring
+					? sha256Hex(toBytes((input as LocalArtworkRestoreInput).expectedBytes))
+					: null;
+				// Check ALL possible local sources, not just the previous extension.
+				// Refuse the entire restore if anyone changed an in-scope file independently.
+				if (restoring && files.some((file) => sha256Hex(file.bytes) !== expected)) {
+					throw new Error('local artwork independently changed; refusing restore');
 				}
-				const folder = dirname(mapped);
-				try {
-					const stats = await stat(folder);
-					if (!stats.isDirectory()) return { status: 'skipped', reason: 'media folder not found' };
-				} catch {
-					return { status: 'skipped', reason: 'media folder not found' };
-				}
-
-				const bytes = input.bytes instanceof Uint8Array ? input.bytes : new Uint8Array(input.bytes);
-				const ext = imageExtensionForBytes(bytes);
-				if (!ext) return { status: 'skipped', reason: 'unrecognized image format' };
-				const name = input.kind === 'poster' ? `folder.${ext}` : `fanart.${ext}`;
-				const target = join(folder, name);
-				const digest = sha256Hex(bytes);
-
-				let targetExists = false;
-				try {
-					const existing = await readFile(target);
-					if (sha256Hex(existing) === digest) return { status: 'unchanged', path: target };
-					targetExists = true;
-				} catch {
-					targetExists = false;
-				}
-
+				const name = `${target.stem}.${ext ?? imageExtensionForBytes(toBytes((input as LocalArtworkRestoreInput).expectedBytes)) ?? 'jpg'}`;
+				const path = join(target.folder, name);
+				const existing = files.find((file) => file.name === name);
+				const unchanged = bytes && existing && sha256Hex(existing.bytes) === sha256Hex(bytes);
+				const displaced = files.filter((file) => !bytes || file.name !== name || !unchanged);
 				const backupDir = join(options.backupRoot, String(input.mediaItemId));
-				const moved: string[] = [];
-				const videoBase = basename(mapped, extname(mapped)).toLowerCase();
-				let entries: string[] = [];
+				const backups = new Map<string, string>();
+				let temporary: string | undefined;
 				try {
-					entries = await readdir(folder);
-				} catch {
-					entries = [];
+					// Stage first: a failed write must not remove existing images.
+					if (bytes && !unchanged) {
+						temporary = join(target.folder, `.${name}.tmp-${randomUUID()}`);
+						await writeFile(temporary, bytes, { mode: 0o644, flag: 'wx' });
+					}
+					for (const file of displaced) {
+						backups.set(
+							file.path,
+							await backupFile(
+								file,
+								backupDir,
+								bytes && file.name === name ? `${name}.replaced` : file.name
+							)
+						);
+					}
+					// Detect edits made while staging/backing up; don't clobber them.
+					const fresh = await readConflicts(target);
+					if (
+						fresh.length !== files.length ||
+						fresh.some(
+							(file) =>
+								!files.some(
+									(prior) =>
+										prior.name === file.name && sha256Hex(prior.bytes) === sha256Hex(file.bytes)
+								)
+						)
+					) {
+						throw new Error('local artwork changed during write');
+					}
+					if (temporary) {
+						await rename(temporary, path);
+						temporary = undefined;
+					}
+					const moved: string[] = [];
+					for (const file of displaced) {
+						if (bytes && file.path === path) continue;
+						await unlink(file.path);
+						moved.push(file.name);
+					}
+					log(`local artwork: ${bytes ? 'reconciled' : 'removed'} ${path}`);
+					if (!bytes)
+						return files.length
+							? { status: 'removed', path, backedUp: backups.values().next().value ?? null }
+							: { status: 'unchanged', path };
+					return unchanged
+						? { status: 'unchanged', path, moved }
+						: { status: 'written', path, moved };
+				} finally {
+					if (temporary) await unlink(temporary).catch(() => {});
 				}
-				for (const entry of entries) {
-					if (entry === name) continue;
-					if (!isConflictFile(entry, input.kind, videoBase)) continue;
-					await mkdir(backupDir, { recursive: true });
-					const backupPath = await uniqueBackupPath(backupDir, entry);
-					await copyFile(join(folder, entry), backupPath);
-					await unlink(join(folder, entry));
-					moved.push(entry);
-				}
-				if (targetExists) {
-					await mkdir(backupDir, { recursive: true });
-					const backupPath = await uniqueBackupPath(backupDir, `${name}.replaced`);
-					await copyFile(target, backupPath);
-				}
-
-				const temporary = join(folder, `.${name}.tmp-${process.pid}-${Date.now()}`);
-				await writeFile(temporary, bytes, { mode: 0o644 });
-				await rename(temporary, target);
-				log(
-					`local artwork: wrote ${target}${moved.length > 0 ? ` (moved: ${moved.join(', ')})` : ''}`
-				);
-				return { status: 'written', path: target, moved };
-			} catch (error) {
-				const reason = error instanceof Error ? error.message : String(error);
-				log(`local artwork: skipped (${reason})`);
-				return { status: 'skipped', reason };
-			}
+			});
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			log(`local artwork: skipped (${reason})`);
+			return { status: 'skipped', reason };
 		}
-	};
+	}
+	return { write: (input) => reconcile(input, false), restore: (input) => reconcile(input, true) };
 }
 
 /**

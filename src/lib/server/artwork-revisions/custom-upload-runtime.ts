@@ -323,15 +323,16 @@ export function createCustomUploadRuntime(dependencies: CustomUploadRuntimeDepen
 		});
 		if (verified && afterArtwork && afterArtwork.data.byteLength > 0 && dependencies.localArtwork) {
 			try {
-				const itemPath = scope.server.getItemMediaPath
-					? await scope.server.getItemMediaPath(scope.item.targetId)
-					: null;
-				await dependencies.localArtwork.write({
-					itemPath,
-					kind: 'poster',
-					bytes: afterArtwork.data,
-					mediaItemId: scope.item.id
-				});
+				const location = await scope.server.getItemMediaLocation?.(scope.item.targetId);
+				if (location) {
+					await dependencies.localArtwork.write({
+						itemPath: location.path,
+						itemType: location.type,
+						kind: 'poster',
+						bytes: afterArtwork.data,
+						mediaItemId: scope.item.id
+					});
+				}
 			} catch {
 				// Never fail the upload over the local mirror.
 			}
