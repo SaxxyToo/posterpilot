@@ -203,15 +203,18 @@ export interface MediaServer {
 	/** Read exact current artwork bytes for snapshots and post-write verification. */
 	readArtwork?(itemId: string, kind: ServerArtworkKind): Promise<ServerArtwork | null>;
 
-	/** The item's on-disk media path (provider's own view), for local artwork mirroring. */
-	getItemMediaPath?(itemId: string): Promise<string | null>;
+	/** Provider path and item type; directory and video artwork have different naming rules. */
+	getItemMediaLocation?(itemId: string): Promise<{
+		path: string;
+		type: 'movie' | 'show' | 'season' | 'episode';
+	} | null>;
 
 	/** Remove an explicitly set artwork slot when the provider supports absence restoration. */
 	deleteArtwork?(itemId: string, kind: ServerArtworkKind): Promise<void>;
 
 	/**
 	 * Lock or unlock a field so the server's automatic agents do not overwrite an
-	 * applied image. A no-op on servers without a lock concept (Jellyfin/Emby).
+	 * applied image. Jellyfin/Emby use an item-wide metadata lock, not per-image locks.
 	 */
 	lockField(itemId: string, field: LockField, locked: boolean): Promise<void>;
 }
