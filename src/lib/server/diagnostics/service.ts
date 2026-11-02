@@ -20,6 +20,7 @@ import {
 import { tmdbAuth } from '$lib/server/tmdb/auth';
 import { createDiagnosticHistoryStore } from './history';
 import { probePath } from './path';
+import { listProviderDiscoveryFailures } from './provider-failures';
 import { runDiagnosticChecks } from './runner';
 import {
 	DiagnosticCheckError,
@@ -320,9 +321,10 @@ export async function runDiagnostics(
 }
 
 export async function getDiagnostics(serverInstanceId?: string, limit = 10) {
-	const [latest, history] = await Promise.all([
+	const [latest, history, providerFailures] = await Promise.all([
 		historyStore.latest(serverInstanceId),
-		historyStore.history(limit, serverInstanceId)
+		historyStore.history(limit, serverInstanceId),
+		listProviderDiscoveryFailures(db, serverInstanceId ?? null)
 	]);
-	return { latest, history };
+	return { latest, history, providerFailures };
 }

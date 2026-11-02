@@ -33,6 +33,12 @@
 
 	type ServerSummary = { id: string; name: string };
 	type RunRow = { id: string; status: string; startedAt: Timestamp };
+	type ProviderFailure = {
+		provider: string;
+		status: string;
+		errorCode: string | null;
+		completedAt: Timestamp;
+	};
 
 	let {
 		initial,
@@ -42,6 +48,7 @@
 		initial: {
 			latest: StatusRow[];
 			history: { run: RunRow; results: unknown[] }[];
+			providerFailures: ProviderFailure[];
 		};
 		servers: ServerSummary[];
 		locale: string;
@@ -51,6 +58,8 @@
 	let statuses = $state<StatusRow[]>(initial.latest);
 	// svelte-ignore state_referenced_locally
 	let history = $state(initial.history);
+	// svelte-ignore state_referenced_locally
+	let providerFailures = $state<ProviderFailure[]>(initial.providerFailures ?? []);
 	let pendingKeys = $state<string[]>([]);
 	let running = $state(false);
 	let runError = $state(false);
@@ -166,6 +175,44 @@
 		if (status === 'partial') return m.diagnostics_run_status_partial();
 		if (status === 'failed') return m.diagnostics_run_status_failed();
 		return m.diagnostics_run_status_running();
+	}
+
+	function providerFailureProviderLabel(provider: string): string {
+		switch (provider) {
+			case 'mediux':
+				return m.diagnostics_component_mediux();
+			case 'fanarttv':
+				return m.diagnostics_component_fanart();
+			case 'theposterdb':
+				return m.diagnostics_component_theposterdb();
+			case 'tmdb':
+				return m.diagnostics_component_tmdb_artwork();
+			default:
+				return provider;
+		}
+	}
+
+	function providerFailureLabel(code: string | null): string {
+		switch (code) {
+			case 'theposterdb_placeholder_only':
+				return m.diagnostics_provider_failure_theposterdb_placeholder();
+			case 'theposterdb_auth_failed':
+				return m.diagnostics_provider_failure_theposterdb_auth();
+			case 'theposterdb_blocked':
+				return m.diagnostics_provider_failure_theposterdb_blocked();
+			case 'mediux_blocked':
+				return m.diagnostics_provider_failure_mediux_blocked();
+			case 'mediux_payload_unreadable':
+				return m.diagnostics_provider_failure_mediux_payload();
+			case 'provider_timeout':
+			case 'timed_out':
+				return m.diagnostics_provider_failure_timeout();
+			case 'provider_failed':
+			case 'provider_discovery_failed':
+				return m.diagnostics_provider_failure_generic();
+			default:
+				return m.diagnostics_provider_failure_unknown({ code: code || 'provider_failed' });
+		}
 	}
 
 	function badgeClass(status: Health): string {
@@ -308,6 +355,7 @@
 			if (refreshed.ok) {
 				const body = (await refreshed.json()) as typeof initial;
 				history = body.history;
+				providerFailures = body.providerFailures ?? [];
 			}
 		} catch {
 			runError = true;
@@ -516,6 +564,23 @@
 				{/if}
 			</article>
 		{/each}
+	</div>
+
+	<div>
+		<h3 class="section-title">{m.diagnostics_provider_failures_title()}</h3>
+		{#if providerFailures.length === 0}
+			<p class="text-sm text-text-muted">{m.diagnostics_provider_failures_empty()}</p>
+		{:else}
+			<ul class="surface divide-y divide-border text-sm">
+				{#each providerFailures as failure (failure.provider)}
+					<li class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-4 py-3">
+						<span class="text-text-bright">{providerFailureProviderLabel(failure.provider)}</span>
+						<span class="text-text-secondary">{providerFailureLabel(failure.errorCode)}</span>
+						<span class="text-xs text-text-faint">{dateTime(failure.completedAt)}</span>
+					</li>
+				{/each}
+			</ul>
+		{/if}
 	</div>
 
 	<div>
