@@ -118,6 +118,17 @@ export interface ArtworkUndoExecutorDependencies {
 		commit: (assertOwned: () => Promise<void>) => Promise<T>
 	): Promise<T>;
 	clock?: () => Date;
+	/** Mirrors the undone artwork into the media folder; best-effort on each verified item. */
+	localArtwork?: {
+		restore(input: {
+			itemPath: string | null;
+			itemType: 'movie' | 'show' | 'season' | 'episode';
+			kind: 'poster' | 'background';
+			mediaItemId: number;
+			bytes: ArrayBuffer | Uint8Array | null;
+			expectedBytes: ArrayBuffer | Uint8Array;
+		}): Promise<{ status: string; path?: string; moved?: string[]; reason?: string }>;
+	};
 }
 
 export interface ExecuteArtworkUndoInput {
@@ -372,6 +383,7 @@ function operationResult(
  */
 export function createArtworkUndoExecutor(dependencies: ArtworkUndoExecutorDependencies) {
 	const clock = dependencies.clock ?? (() => new Date());
+	const localArtwork = dependencies.localArtwork;
 
 	return async function executeArtworkUndo(
 		input: ExecuteArtworkUndoInput
@@ -601,6 +613,37 @@ export function createArtworkUndoExecutor(dependencies: ArtworkUndoExecutorDepen
 			}
 		}
 
+		/**
+		 * Best-effort mirror of the undone artwork into the media folder. Only fires
+		 * after a verified server item undo when the server exposes the item's media
+		 * location. Failures here never fail the operation.
+		 */
+		async function mirrorLocalArtwork(
+			server: MediaServer,
+			operation: UndoPlanOperation,
+			before: CurrentServerObservation,
+			after: CurrentServerObservation
+		): Promise<void> {
+			if (!localArtwork || !before.artwork) return;
+			const location =
+				typeof server.getItemMediaLocation === 'function'
+					? await server.getItemMediaLocation(operation.targetId)
+					: null;
+			if (!location) return;
+			const bytes =
+				after.state === 'present' && after.artwork
+					? arrayBuffer(new Uint8Array(after.artwork.data))
+					: null;
+			await localArtwork.restore({
+				itemPath: location.path,
+				itemType: location.type,
+				kind: serverArtworkKind(operation.slot),
+				mediaItemId: targetFields(operation.target).mediaItemId!,
+				bytes,
+				expectedBytes: arrayBuffer(new Uint8Array(before.artwork.data))
+			});
+		}
+
 		async function executeServerOperation(
 			operation: UndoPlanOperation,
 			groupId: string
@@ -812,13 +855,21 @@ export function createArtworkUndoExecutor(dependencies: ArtworkUndoExecutorDepen
 
 			if (desired.snapshot.state === 'absent') {
 				const exact = after.state === 'absent';
-				return record(operation, groupId, {
+				const result = await record(operation, groupId, {
 					...afterBase,
 					status: exact ? 'success' : 'failed',
 					verification: exact ? 'exact' : 'mismatch',
 					errorCode: exact ? null : 'undo_server_verify_mismatch',
 					verified: exact
 				});
+				if (exact && operation.target.kind === 'item') {
+					try {
+						await mirrorLocalArtwork(server, operation, before, after);
+					} catch {
+						// Best-effort; failures do not hide the successful API undo
+					}
+				}
+				return result;
 			}
 
 			const verification = verifyServerArtworkRead({
@@ -828,13 +879,22 @@ export function createArtworkUndoExecutor(dependencies: ArtworkUndoExecutorDepen
 				expectedSha256,
 				after: after.artwork ?? null
 			});
-			return record(operation, groupId, {
+			const verified = verification.ok;
+			const result = await record(operation, groupId, {
 				...afterBase,
-				status: verification.ok ? 'success' : 'failed',
+				status: verified ? 'success' : 'failed',
 				verification: verification.verification,
-				errorCode: verification.ok ? null : 'undo_server_verify_mismatch',
-				verified: verification.ok
+				errorCode: verified ? null : 'undo_server_verify_mismatch',
+				verified
 			});
+			if (verified && operation.target.kind === 'item') {
+				try {
+					await mirrorLocalArtwork(server, operation, before, after);
+				} catch {
+					// Best-effort; failures do not hide the successful API undo
+				}
+			}
+			return result;
 		}
 
 		async function executeFencedKometaOperation(

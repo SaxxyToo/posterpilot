@@ -534,11 +534,11 @@ export function createArtworkApplyCoordinator(options: ArtworkApplyCoordinatorOp
 	): Promise<void> {
 		if (!options.localArtwork) return;
 		try {
-			const itemPath = server?.getItemMediaPath
-				? await server.getItemMediaPath(operation.targetId)
-				: null;
+			const location = await server?.getItemMediaLocation?.(operation.targetId);
+			if (!location) return;
 			await options.localArtwork.write({
-				itemPath,
+				itemPath: location.path,
+				itemType: location.type,
 				kind: serverArtworkKind(operation),
 				bytes,
 				mediaItemId: operation.target.mediaItemId

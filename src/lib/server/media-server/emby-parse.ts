@@ -37,6 +37,7 @@ export interface RawEmbyItem {
 	DateCreated?: string | null;
 	/** On-disk path of the item's media file, in the server's own container view. */
 	Path?: string | null;
+	LocationType?: string | null;
 	/** Per-user playback state (requires the authenticated user context). */
 	UserData?: { Played?: boolean | null } | null;
 }

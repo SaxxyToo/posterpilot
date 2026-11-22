@@ -240,6 +240,40 @@ function executionResult(
 	};
 }
 
+describe('local artwork destination forwarding', () => {
+	it.each(['show', 'season', 'episode'] as const)(
+		'mirrors verified %s artwork at the typed provider location',
+		async (type) => {
+			const before = artwork('old', 'before');
+			const after = artwork('new', 'after');
+			const server = serverReader(before, after);
+			server.getItemMediaLocation = vi.fn(async () => ({ path: '/data/tv/Show/Season 01', type }));
+			const write = vi.fn(async () => ({ status: 'unchanged' as const, path: '/media/art.png' }));
+			const subject = createArtworkApplyCoordinator({
+				snapshots,
+				ledger,
+				planId: 'plan-global',
+				kometaAssetsDirectory: kometaDirectory,
+				fetchArtworkBytes: async () => after.data,
+				localArtwork: { write, restore: vi.fn() }
+			});
+			const op = operation({ id: 'mirror', type: 'show', targetId: 'child-id' });
+			op.current.fingerprint = sha256Bytes(before.data);
+			await subject.prepareOperation(op, { server });
+			const result = await subject.recordOutcome(op, successfulWrite(op), { server });
+			expect(result.status).toBe('success');
+			expect(server.getItemMediaLocation).toHaveBeenCalledWith('child-id');
+			expect(write).toHaveBeenCalledWith({
+				itemPath: '/data/tv/Show/Season 01',
+				itemType: type,
+				kind: 'poster',
+				bytes: after.data,
+				mediaItemId: 1
+			});
+		}
+	);
+});
+
 function coordinator(
 	preflight: NonNullable<ArtworkApplyCoordinatorOptions['fetchArtworkBytes']> = async (url) => ({
 		bytes: bytes(url),

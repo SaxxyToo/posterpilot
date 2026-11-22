@@ -70,6 +70,7 @@ interface ServerHarness {
 	applyBackgroundBytes: ReturnType<typeof vi.fn>;
 	deleteArtwork: ReturnType<typeof vi.fn>;
 	lockField: ReturnType<typeof vi.fn>;
+	getItemMediaLocation: NonNullable<MediaServer['getItemMediaLocation']> | undefined;
 }
 
 function serverHarness(input: {
@@ -80,6 +81,7 @@ function serverHarness(input: {
 	deleteSupported?: boolean;
 	posterFails?: boolean;
 	backgroundFails?: boolean;
+	getItemMediaLocation?: MediaServer['getItemMediaLocation'];
 }): ServerHarness {
 	let current = input.current;
 	const applyPosterBytes = vi.fn(async (_id: string, bytes: ArrayBuffer) => {
@@ -96,6 +98,9 @@ function serverHarness(input: {
 		current = null;
 	});
 	const lockField = vi.fn(async () => undefined);
+	const getItemMediaLocation =
+		input.getItemMediaLocation ??
+		(vi.fn(async () => null) as unknown as MediaServer['getItemMediaLocation']);
 	const type = input.type ?? 'plex';
 	const server: MediaServer = {
 		type,
@@ -121,7 +126,8 @@ function serverHarness(input: {
 		applyBackgroundBytes,
 		readArtwork: vi.fn(async () => current),
 		...(input.deleteSupported ? { deleteArtwork } : {}),
-		lockField
+		lockField,
+		getItemMediaLocation
 	};
 	return {
 		server,
@@ -129,10 +135,10 @@ function serverHarness(input: {
 		applyPosterBytes,
 		applyBackgroundBytes,
 		deleteArtwork,
-		lockField
+		lockField,
+		getItemMediaLocation
 	};
 }
-
 function snapshot(
 	id: string,
 	input: Partial<ArtworkSnapshot> & Pick<ArtworkSnapshot, 'destination' | 'kind' | 'state'>
@@ -392,6 +398,7 @@ function executorHarness(input: {
 	preflightKometa?: ArtworkUndoExecutorDependencies['preflightKometa'];
 	withKometaCommit?: ArtworkUndoExecutorDependencies['withKometaCommit'];
 	serverUnavailable?: boolean;
+	localArtwork?: Record<string, unknown>;
 }) {
 	const ledger = input.ledger ?? ledgerHarness();
 	const kometa = input.kometa ?? defaultKometa();
@@ -408,7 +415,8 @@ function executorHarness(input: {
 		readKometa: kometa.read,
 		mutateKometa: kometa.mutate,
 		withKometaCommit: input.withKometaCommit,
-		clock: () => NOW
+		clock: () => NOW,
+		localArtwork: input.localArtwork as ArtworkUndoExecutorDependencies['localArtwork']
 	});
 	return { executor, ledger, kometa };
 }
@@ -1351,5 +1359,583 @@ describe('isolated failures and plan safety', () => {
 		);
 		expect(harness.ledger.createGroup).not.toHaveBeenCalled();
 		expect(server.applyPosterBytes).not.toHaveBeenCalled();
+	});
+});
+
+describe('local artwork mirror on undo', () => {
+	type LocalArtworkItemType = 'movie' | 'show' | 'season' | 'episode';
+
+	interface LocalArtworkRestoreInput {
+		itemPath: string | null;
+		itemType: LocalArtworkItemType;
+		kind: 'poster' | 'background';
+		mediaItemId: number;
+		bytes: ArrayBuffer | Uint8Array | null;
+		expectedBytes: ArrayBuffer | Uint8Array;
+	}
+
+	function localArtworkHarness() {
+		const write = vi.fn();
+		const restore = vi.fn();
+		return { writer: { write, restore } as unknown as Record<string, unknown>, restore };
+	}
+
+	it('calls localArtwork.restore after a successful verified server undo (present→present)', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-local-mirror');
+		const desired = snapshot('snapshot-local-mirror-present', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-mirror-present',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn(async () => ({
+			path: '/data/movies/Title (2020)/Title.mkv',
+			type: 'movie' as const
+		})) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-secret'),
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-mirror-present',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(server.getItemMediaLocation).toHaveBeenCalledWith('server-target-1');
+		expect(local.restore).toHaveBeenCalledWith(
+			expect.objectContaining<Partial<LocalArtworkRestoreInput>>({
+				itemPath: '/data/movies/Title (2020)/Title.mkv',
+				itemType: 'movie',
+				kind: 'poster',
+				mediaItemId: 1
+			})
+		);
+		const restoreCall = local.restore.mock.calls[0][0] as LocalArtworkRestoreInput;
+		expect(restoreCall.bytes).toBeTruthy();
+		expect(restoreCall.bytes!.byteLength).toBe(3);
+		expect(restoreCall.expectedBytes).toBeTruthy();
+		expect(restoreCall.expectedBytes.byteLength).toBe(3);
+	});
+
+	it('calls localArtwork.restore with null bytes after present→absent undo', async () => {
+		const before = artwork([1, 2, 3], 'before-absent-mirror');
+		const desired = snapshot('snapshot-local-absent-mirror', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'absent'
+		});
+		const snapshots = snapshotHarness([{ row: desired }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn(async () => ({
+			path: '/data/movies/Title (2020)/Title.mkv',
+			type: 'movie' as const
+		})) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			deleteSupported: true,
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-absent-mirror',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 4
+				},
+				snapshot: { state: 'absent', fingerprint: null, restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).toHaveBeenCalledWith(
+			expect.objectContaining<Partial<LocalArtworkRestoreInput>>({
+				itemPath: '/data/movies/Title (2020)/Title.mkv',
+				itemType: 'movie',
+				kind: 'poster',
+				mediaItemId: 1,
+				bytes: null
+			})
+		);
+	});
+
+	it('does not call localArtwork.restore when the server undo fails', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-fail-mirror');
+		const desired = snapshot('snapshot-local-fail-mirror', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-fail-mirror',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn() as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			posterFails: true,
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-fail-mirror',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 1
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		await execute(harness.executor, plan);
+
+		expect(local.restore).not.toHaveBeenCalled();
+	});
+
+	it('does not call localArtwork.restore when verification fails', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-verify-fail');
+		const transcoded = artwork([4, 5, 6], 'wrong-bytes');
+		const desired = snapshot('snapshot-local-verify-fail', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-verify-fail'
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn() as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			afterPoster: transcoded,
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-verify-fail',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 2
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		await execute(harness.executor, plan);
+
+		expect(local.restore).not.toHaveBeenCalled();
+	});
+
+	it('does not mirror for collection targets', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-collection');
+		const desired = snapshot('snapshot-local-collection', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-collection',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-collection')
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-collection',
+				target: { kind: 'collection', mediaCollectionId: 'collection-1' },
+				targetId: 'collection-1',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 3
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		await execute(harness.executor, plan);
+
+		expect(local.restore).not.toHaveBeenCalled();
+		expect(server.getItemMediaLocation).not.toHaveBeenCalled();
+	});
+
+	it('skips mirror when localArtwork dependency is not configured', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-no-config');
+		const desired = snapshot('snapshot-local-no-config', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-no-config',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-no-config')
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-no-config',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({ server: server.server, snapshots });
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(server.getItemMediaLocation).not.toHaveBeenCalled();
+	});
+
+	it('skips mirror when getItemMediaLocation is unavailable', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-no-location');
+		const desired = snapshot('snapshot-local-no-location', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-no-location',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-no-location')
+		});
+		// Remove getItemMediaLocation to simulate server without it
+		delete (server.server as unknown as Record<string, unknown>)['getItemMediaLocation'];
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-no-location',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).not.toHaveBeenCalled();
+	});
+
+	it('skips mirror when getItemMediaLocation returns null', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-null-location');
+		const desired = snapshot('snapshot-local-null-location', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-null-location',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn(async () => null) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-null-location'),
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-null-location',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).not.toHaveBeenCalled();
+	});
+
+	it('does not fail the operation when localArtwork.restore throws', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-throw-mirror');
+		const desired = snapshot('snapshot-local-throw-mirror', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-throw-mirror',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const restore = vi.fn(async () => {
+			throw new Error('disk full');
+		});
+		const local = {
+			writer: { write: vi.fn(), restore } as unknown as Record<string, unknown>,
+			restore
+		};
+		const locationMock = vi.fn(async () => ({
+			path: '/data/movies/Title (2020)/Title.mkv',
+			type: 'movie' as const
+		})) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-throw'),
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-throw-mirror',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).toHaveBeenCalled();
+	});
+
+	it('mirrors background artwork independently after a verified undo', async () => {
+		const oldPoster = Uint8Array.from([9, 8, 7]);
+		const oldBackground = Uint8Array.from([1, 2, 3]);
+		const beforePoster = artwork([4, 5, 6], 'before-bg-poster');
+		const posterDesired = snapshot('snapshot-local-bg-poster', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(oldPoster),
+			storagePath: '/private/snapshots/local-bg-poster',
+			contentType: 'image/jpeg',
+			sizeBytes: oldPoster.byteLength
+		});
+		const bgDesired = snapshot('snapshot-local-bg-background', {
+			destination: 'server',
+			kind: 'background',
+			state: 'present',
+			sha256: sha256Bytes(oldBackground),
+			storagePath: '/private/snapshots/local-bg-background',
+			contentType: 'image/jpeg',
+			sizeBytes: oldBackground.byteLength
+		});
+		const snapshots = snapshotHarness([
+			{ row: posterDesired, bytes: oldPoster },
+			{ row: bgDesired, bytes: oldBackground }
+		]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn(async () => ({
+			path: '/data/tv/Show (2020)/Season 1/S01E01.mkv',
+			type: 'episode' as const
+		})) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: beforePoster,
+			afterPoster: artwork([9, 8, 7], 'restored-bg-poster'),
+			afterBackground: artwork([1, 2, 3], 'restored-bg-bg', 'background'),
+			getItemMediaLocation: locationMock
+		});
+		const currentFingerprint = sha256Bytes(beforePoster.data);
+		// After the poster undo, the server holds the restored poster bytes
+		const afterPosterBytes = Uint8Array.from([9, 8, 7]);
+		const afterFingerprint = sha256Bytes(afterPosterBytes);
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-bg-poster',
+				beforeSnapshotId: posterDesired.id,
+				current: {
+					state: 'present',
+					fingerprint: currentFingerprint,
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(oldPoster), restorable: true }
+			}),
+			candidate({
+				revisionId: 'revision-local-bg-background',
+				beforeSnapshotId: bgDesired.id,
+				slot: ROOT_BACKGROUND,
+				current: {
+					state: 'present',
+					fingerprint: afterFingerprint,
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(oldBackground), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).toHaveBeenCalledTimes(2);
+		expect(local.restore).toHaveBeenCalledWith(
+			expect.objectContaining<Partial<LocalArtworkRestoreInput>>({
+				itemType: 'episode',
+				kind: 'poster'
+			})
+		);
+		expect(local.restore).toHaveBeenCalledWith(
+			expect.objectContaining<Partial<LocalArtworkRestoreInput>>({
+				itemType: 'episode',
+				kind: 'background'
+			})
+		);
+	});
+
+	it('mirrors with the correct itemType for show targets', async () => {
+		const old = Uint8Array.from([9, 8, 7]);
+		const before = artwork([1, 2, 3], 'before-show');
+		const desired = snapshot('snapshot-local-show', {
+			destination: 'server',
+			kind: 'poster',
+			state: 'present',
+			sha256: sha256Bytes(old),
+			storagePath: '/private/snapshots/local-show',
+			contentType: 'image/jpeg',
+			sizeBytes: old.byteLength
+		});
+		const snapshots = snapshotHarness([{ row: desired, bytes: old }]);
+		const local = localArtworkHarness();
+		const locationMock = vi.fn(async () => ({
+			path: '/data/tv/Show (2020)/Show.mkv',
+			type: 'show' as const
+		})) as unknown as MediaServer['getItemMediaLocation'];
+		const server = serverHarness({
+			current: before,
+			afterPoster: artwork([9, 8, 7], 'restored-show'),
+			getItemMediaLocation: locationMock
+		});
+		const plan = builtPlan([
+			candidate({
+				revisionId: 'revision-local-show',
+				beforeSnapshotId: desired.id,
+				current: {
+					state: 'present',
+					fingerprint: sha256Bytes(before.data),
+					artworkVersion: 5
+				},
+				snapshot: { state: 'present', fingerprint: sha256Bytes(old), restorable: true }
+			})
+		]);
+		const harness = executorHarness({
+			server: server.server,
+			snapshots,
+			localArtwork: local.writer
+		});
+
+		const result = await execute(harness.executor, plan);
+
+		expect(result.status).toBe('success');
+		expect(local.restore).toHaveBeenCalledWith(
+			expect.objectContaining<Partial<LocalArtworkRestoreInput>>({
+				itemPath: '/data/tv/Show (2020)/Show.mkv',
+				itemType: 'show',
+				kind: 'poster',
+				mediaItemId: 1
+			})
+		);
 	});
 });

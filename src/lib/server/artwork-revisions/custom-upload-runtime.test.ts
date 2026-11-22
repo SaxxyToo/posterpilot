@@ -140,7 +140,11 @@ interface Fixture {
 
 function fixture(
 	reads: Array<ServerArtwork | null | Error>,
-	options: { fieldLockSupported?: boolean } = {}
+	options: {
+		fieldLockSupported?: boolean;
+		localArtwork?: CustomUploadRuntimeDependencies['localArtwork'];
+		location?: { path: string; type: 'show' };
+	} = {}
 ): Fixture {
 	const events: string[] = [];
 	const store = new MemoryPlanStore(events);
@@ -185,12 +189,14 @@ function fixture(
 		identity: { instanceId: 'server-a', name: 'Server A', type: 'plex' },
 		...(options.fieldLockSupported ? { capabilities: { fieldLock: 'supported' as const } } : {}),
 		readArtwork,
+		getItemMediaLocation: async () => options.location ?? null,
 		applyPosterBytes,
 		lockField
 	} as unknown as MediaServer;
 	const active = { value: 'server-a' as string | null };
 	const coverageRefreshes: { trigger: string; scope: { mediaItemIds: number[] } }[] = [];
 	const dependencies: CustomUploadRuntimeDependencies = {
+		localArtwork: options.localArtwork,
 		store,
 		snapshots: { captureServer } as unknown as ArtworkSnapshotRepository,
 		ledger: {
@@ -256,6 +262,29 @@ function confirmation(
 
 describe('custom upload runtime', () => {
 	beforeEach(() => vi.clearAllMocks());
+
+	it('mirrors a custom show poster using the typed provider directory', async () => {
+		const before = artwork(jpeg(1), 'before');
+		const after = artwork(jpeg(9), 'after');
+		const write = vi.fn(async () => ({
+			status: 'unchanged' as const,
+			path: '/media/Show/folder.jpg'
+		}));
+		const subject = fixture([before, before, after], {
+			localArtwork: { write, restore: vi.fn() },
+			location: { path: '/data/Show', type: 'show' }
+		});
+		const plan = await preview(subject);
+		const result = await subject.runtime.confirm(confirmation(plan));
+		expect(result.ok).toBe(true);
+		expect(write).toHaveBeenCalledWith({
+			itemPath: '/data/Show',
+			itemType: 'show',
+			kind: 'poster',
+			bytes: after.data,
+			mediaItemId: 7
+		});
+	});
 
 	it('previews the live active item without snapshots, revisions, or server mutation', async () => {
 		const before = artwork(jpeg(1), 'before');

@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import type { AppConfig } from '$lib/server/config';
 import { resolveConfig } from '$lib/server/config';
 import { resolveDataPaths } from '$lib/server/data-paths';
+import { createLocalArtworkWriterFromEnv } from '$lib/server/media-folders/local-artwork';
 import { refreshCoverageAfter } from '$lib/server/coverage/refresh';
 import { db } from '$lib/server/db';
 import {
@@ -631,9 +632,9 @@ let liveExecutor: ArtworkUndoExecutor | null = null;
 function executor(): ArtworkUndoExecutor {
 	if (liveExecutor) return liveExecutor;
 	const serverRegistry = createDatabaseApplyServerRegistry();
-	const snapshotStore = new ArtworkSnapshotStore(
-		resolveArtworkSnapshotDirectory(resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE))
-	);
+	const dataPaths = resolveDataPaths(env.DATABASE_URL, env.APP_KEY_FILE);
+	const snapshotStore = new ArtworkSnapshotStore(resolveArtworkSnapshotDirectory(dataPaths));
+	const localArtwork = createLocalArtworkWriterFromEnv(env, dataPaths.dataDirectory);
 	const kometa = createBoundKometaUndoAccess({
 		loadConfig: resolveConfig,
 		resolveBinding: resolveKometaServerBinding,
@@ -653,7 +654,8 @@ function executor(): ArtworkUndoExecutor {
 		preflightKometa: kometa.preflightKometa,
 		readKometa: kometa.readKometa,
 		mutateKometa: kometa.mutateKometa,
-		withKometaCommit: kometa.withKometaCommit
+		withKometaCommit: kometa.withKometaCommit,
+		localArtwork: localArtwork ?? undefined
 	});
 	return liveExecutor;
 }

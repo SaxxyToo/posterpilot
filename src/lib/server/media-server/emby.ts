@@ -301,17 +301,29 @@ export function embyLikeProvider(
 		};
 	}
 
-	/**
-	 * The item's on-disk media path (in the server's container view), used to
-	 * mirror applied artwork into the media folder as a local file.
-	 */
-	async function readItemMediaPath(itemId: string): Promise<string | null> {
+	/** Preserve item type: show/season paths name directories, movie/episode paths name files. */
+	async function readItemMediaLocation(
+		itemId: string
+	): ReturnType<NonNullable<MediaServer['getItemMediaLocation']>> {
 		try {
 			const listed = await getJson<RawEmbyItemsResponse>(
 				`/Items?ids=${encodeURIComponent(itemId)}&Fields=Path`
 			);
-			const item = listed.Items?.[0];
-			return typeof item?.Path === 'string' && item.Path.length > 0 ? item.Path : null;
+			const item = listed.Items?.find((entry) => entry.Id === itemId);
+			if (
+				typeof item?.Path !== 'string' ||
+				!item.Path ||
+				(item.LocationType != null && item.LocationType !== 'FileSystem')
+			)
+				return null;
+			const types = {
+				Movie: 'movie',
+				Series: 'show',
+				Season: 'season',
+				Episode: 'episode'
+			} as const;
+			if (!item.Type || !Object.hasOwn(types, item.Type)) return null;
+			return { path: item.Path, type: types[item.Type as keyof typeof types] };
 		} catch {
 			return null;
 		}
@@ -624,7 +636,7 @@ export function embyLikeProvider(
 
 		readArtwork: readCurrentArtwork,
 
-		getItemMediaPath: readItemMediaPath,
+		getItemMediaLocation: readItemMediaLocation,
 
 		deleteArtwork: deleteCurrentArtwork,
 
